@@ -362,15 +362,53 @@ function adminMembersPage({ user, query, members }) {
   return layout({ title: 'Admin · Members', user, active: 'admin', body, query });
 }
 
-function adminMembershipsPage({ user, query, requests }) {
+function adminMembershipsPage({ user, query, requests, plans = [] }) {
   const pendingCount = requests.filter((r) => r.status === 'pending').length;
+  const periodOptions = ['term', 'year', 'one-off'];
+  const plansSection = `
+      <div class="section-head" style="margin-top:8px;">
+        <h3 class="h3">Membership plans</h3>
+      </div>
+      <p class="muted" style="font-size:0.85rem;">Only <b>Active</b> plans show on the public <a href="/membership" class="accent">/membership</a> page. A plan with existing members can't be deleted — deactivate it instead so those members keep their record.</p>
+      <div class="admin-cards-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(280px,1fr)); gap:16px; margin-bottom:36px;">
+        ${plans.map((p) => `
+        <div class="card">
+          <form method="POST" action="/admin/membership-plans/${p.id}">
+            <div class="field"><label>Name</label><input type="text" name="name" value="${escapeHtml(p.name)}" required></div>
+            <div class="field"><label>Price (£)</label><input type="number" name="price" step="0.01" min="0" value="${(p.price_cents / 100).toFixed(2)}" required></div>
+            <div class="field">
+              <label>Billed per</label>
+              <select name="period">
+                ${periodOptions.map((opt) => `<option value="${opt}" ${p.period === opt ? 'selected' : ''}>${opt}</option>`).join('')}
+              </select>
+            </div>
+            <div class="field"><label>Tagline</label><input type="text" name="tagline" value="${escapeHtml(p.tagline)}"></div>
+            <div class="field"><label>Perks (one per line)</label><textarea name="perks" rows="3">${escapeHtml(p.perks)}</textarea></div>
+            <div class="field"><label>Sort order</label><input type="number" name="sort_order" value="${p.sort_order}"></div>
+            <div class="field" style="display:flex; align-items:center; gap:8px;">
+              <label style="margin:0;"><input type="checkbox" name="is_active" ${p.is_active ? 'checked' : ''} style="width:auto;"> Active (visible for new sign-ups)</label>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <button type="submit" class="btn btn-solid btn-sm">Save</button>
+              <span class="muted" style="font-size:0.78rem;">${p.member_count} member${p.member_count === 1 ? '' : 's'} on this plan</span>
+            </div>
+          </form>
+          ${p.member_count === 0 ? `
+          <form method="POST" action="/admin/membership-plans/${p.id}/delete" style="margin-top:8px;"
+            onsubmit="return confirm('Delete the &quot;${escapeHtml(p.name).replace(/'/g, "\\'")}&quot; plan permanently? This can\\'t be undone.');">
+            <button type="submit" class="btn btn-sm">Delete plan</button>
+          </form>` : ''}
+        </div>`).join('')}
+      </div>`;
   const body = `
   <section style="padding-top:48px;">
     <div class="wrap">
       <div class="eyebrow">Admin</div>
-      <h1 class="h2">Membership requests</h1>
+      <h1 class="h2">Membership</h1>
       ${flash(query)}
       ${adminNav('memberships')}
+      ${plansSection}
+      <h3 class="h3" style="margin-bottom:12px;">Requests</h3>
       ${pendingCount > 1 ? `
       <form method="POST" action="/admin/memberships/bulk-approve" class="bulk-form" id="bulkApproveMemberships">
         <input type="hidden" name="ids" value="">
@@ -475,6 +513,7 @@ function adminRepsPage({ user, query, reps, candidateUsers, events, commissionPe
       <div class="split">
         <div class="card">
           <h3 class="h3" style="margin-bottom:16px;">Make a member a rep</h3>
+          <p class="muted" style="font-size:0.8rem; margin-top:-10px; margin-bottom:12px;">For someone who already has an account on the site.</p>
           <form method="POST" action="/admin/reps">
             <div class="field">
               <label>Member</label>
@@ -485,6 +524,18 @@ function adminRepsPage({ user, query, reps, candidateUsers, events, commissionPe
             </div>
             <div class="field"><label>Rep code</label><input type="text" name="rep_code" placeholder="e.g. AMOR07" required></div>
             <button type="submit" class="btn btn-solid">Add rep</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h3 class="h3" style="margin-bottom:16px;">Create a new rep account</h3>
+          <p class="muted" style="font-size:0.8rem; margin-top:-10px; margin-bottom:12px;">For someone who hasn't signed up yet — creates their login and makes them a rep in one step. Leave password blank to auto-generate one.</p>
+          <form method="POST" action="/admin/reps/create">
+            <div class="field"><label>Name</label><input type="text" name="name" required></div>
+            <div class="field"><label>Email</label><input type="email" name="email" required></div>
+            <div class="field"><label>Password</label><input type="text" name="password" placeholder="Leave blank to auto-generate" minlength="8"></div>
+            <div class="field"><label>Rep code</label><input type="text" name="rep_code" placeholder="e.g. AMOR07" required></div>
+            <button type="submit" class="btn btn-solid">Create account &amp; add as rep</button>
           </form>
         </div>
 
@@ -512,15 +563,16 @@ function adminRepsPage({ user, query, reps, candidateUsers, events, commissionPe
       </div>
 
       <div class="section-head" style="margin-top:36px;">
-        <h3 class="h3">All reps</h3>
+        <h3 class="h3">All reps — leaderboard (by total sold)</h3>
         <a href="/admin/export/rep-sales.csv" class="muted">Export CSV →</a>
       </div>
       <div class="admin-table-wrap">
       <table class="simple">
-        <thead><tr><th>Name</th><th>Code</th><th>Status</th><th>Total sold</th><th>Commission owed (lifetime)</th><th>Profile (shown on public leaderboard)</th><th>Quick-log a sale</th></tr></thead>
+        <thead><tr><th>#</th><th>Name</th><th>Code</th><th>Status</th><th>Total sold</th><th>Commission owed (lifetime)</th><th>Profile (shown on public leaderboard)</th><th>Quick-log a sale</th></tr></thead>
         <tbody>
-          ${reps.map((r) => `
+          ${reps.map((r, i) => `
           <tr>
+            <td class="muted">${i + 1}</td>
             <td>${escapeHtml(r.name)}</td>
             <td class="muted">${escapeHtml(r.rep_code)}</td>
             <td><span class="pill ${r.status === 'active' ? 'pill-active' : ''}">${escapeHtml(r.status)}</span></td>

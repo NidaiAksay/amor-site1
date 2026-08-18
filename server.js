@@ -159,6 +159,23 @@ function serveStatic(req, res, pathname) {
   return true;
 }
 
+// Auto-flips events from 'upcoming' to 'past' once their date has gone by,
+// so the homepage "Events run" counter (and the /events/past listing) stay
+// correct on their own — no need for the admin to remember to flip the
+// status dropdown by hand after every night. Throttled to once a minute
+// (module-level, resets on restart) rather than run on literally every
+// request, since it's a write and the exact minute it flips doesn't matter.
+// Only ever moves 'upcoming' -> 'past' — a 'cancelled' event is never
+// touched, so cancelling still overrides the date-based check.
+let lastPastEventCheck = 0;
+function promotePastEventsIfNeeded() {
+  const nowMs = Date.now();
+  if (nowMs - lastPastEventCheck < 60000) return;
+  lastPastEventCheck = nowMs;
+  const today = new Date().toISOString().slice(0, 10);
+  db.prepare("UPDATE events SET status='past' WHERE status='upcoming' AND event_date < ?").run(today);
+}
+
 function computePoints(quantity, membershipPlanSlug) {
   const multiplier = ['plus', 'all-access', 'unlimited'].includes(membershipPlanSlug) ? 2 : 1;
   return quantity * POINTS_PER_TICKET * multiplier;
@@ -314,6 +331,7 @@ const server = http.createServer(async (req, res) => {
     const query = Object.fromEntries(url.searchParams.entries());
     const user = auth.currentUser(req);
     const visitorId = analytics.ensureVisitorId(req, res);
+    promotePastEventsIfNeeded();
 
     if (req.method === 'GET' && /^\/(css|js|uploads|img)\//.test(pathname)) {
       if (serveStatic(req, res, pathname)) return;
@@ -324,7 +342,7 @@ const server = http.createServer(async (req, res) => {
       return handleTrack(req, res, visitorId);
     }
 
-    if (req.method === 'GET' && analytics.shouldLogPageView(pathname)) {
+    if (req.method === 'GET' && analytics.shouldLogPageView(pathname) && !analytics.isBot(req.headers['user-agent'])) {
       analytics.logPageView(pathname, visitorId, user ? user.id : null);
       if (query.rep) {
         analytics.logSiteEvent('rep_link_hit', { path: pathname, repCode: String(query.rep).toUpperCase(), visitorId });
@@ -545,7 +563,7 @@ ${urls.map((u) => `  <url><loc>${escapeHtml(u.loc)}</loc><priority>${u.priority}
 
   // ---------------- Membership ----------------
   if (method === 'GET' && pathname === '/membership') {
-    const plans = db.prepare('SELECT * FROM membership_plans ORDER BY sort_order ASC').all();
+    const plans = db.prepare('SELECT * FROM membership_plans WHERE is_active = 1 ORDER BY sort_order ASC').all();
     const currentMembership = user ? getActiveMembership(user.id) : null;
     return send(res, 200, membershipPage({ user, query, plans, currentMembership }));
   }
@@ -554,8 +572,8 @@ ${urls.map((u) => `  <url><loc>${escapeHtml(u.loc)}</loc><priority>${u.priority}
     if (!user) return redirect(res, '/login?next=/membership');
     const { fields } = await parseFormBody(req);
     const planId = parseInt(fields.plan_id, 10);
-    const plan = db.prepare('SELECT * FROM membership_plans WHERE id = ?').get(planId);
-    if (!plan) return redirect(res, withQuery('/membership', { error: 'Plan not found.' }));
+    const plan = db.prepare('SELECT * FROM membership_plans WHERE id = ? AND is_active = 1').get(planId);
+    if (!plan) return redirect(res, withQuery('/membership', { error: 'That plan is no longer available.' }));
     const existing = getActiveMembership(user.id);
     if (existing && (existing.status === 'active' || existing.status === 'pending')) {
       return redirect(res, withQuery('/membership', { error: 'You already have a membership on file.' }));
@@ -1247,7 +1265,42 @@ async function adminRoute(req, res, ctx) {
       JOIN membership_plans ON membership_plans.id = memberships.plan_id
       ORDER BY memberships.requested_at DESC
     `).all();
-    return send(res, 200, adminMembershipsPage({ user, query, requests }));
+    const plans = db.prepare(`
+      SELECT membership_plans.*,
+        (SELECT COUNT(*) FROM memberships WHERE plan_id = membership_plans.id) as member_count
+      FROM membership_plans ORDER BY sort_order ASC
+    `).all();
+    return send(res, 200, adminMembershipsPage({ user, query, requests, plans }));
+  }
+
+  if (method === 'POST' && (m = pathname.match(/^\/admin\/membership-plans\/(\d+)$/))) {
+    const plan = db.prepare('SELECT * FROM membership_plans WHERE id = ?').get(m[1]);
+    if (!plan) return send(res, 404, 'Not found');
+    const { fields } = await parseFormBody(req);
+    const priceCents = Math.round(parseFloat(fields.price) * 100) || 0;
+    db.prepare(`UPDATE membership_plans SET name=?, price_cents=?, period=?, tagline=?, perks=?, sort_order=?, is_active=? WHERE id=?`)
+      .run(
+        (fields.name || plan.name).trim(),
+        priceCents,
+        fields.period || plan.period,
+        (fields.tagline || '').trim(),
+        (fields.perks || '').trim(),
+        parseInt(fields.sort_order, 10) || 0,
+        fields.is_active ? 1 : 0,
+        plan.id
+      );
+    return redirect(res, withQuery('/admin/memberships', { ok: `${plan.name} updated.` }));
+  }
+
+  if (method === 'POST' && (m = pathname.match(/^\/admin\/membership-plans\/(\d+)\/delete$/))) {
+    const plan = db.prepare('SELECT * FROM membership_plans WHERE id = ?').get(m[1]);
+    if (!plan) return send(res, 404, 'Not found');
+    const memberCount = db.prepare('SELECT COUNT(*) c FROM memberships WHERE plan_id = ?').get(plan.id).c;
+    if (memberCount > 0) {
+      return redirect(res, withQuery('/admin/memberships', { error: `Can't delete "${plan.name}" — it still has ${memberCount} member record(s). Deactivate it instead.` }));
+    }
+    db.prepare('DELETE FROM membership_plans WHERE id = ?').run(plan.id);
+    return redirect(res, withQuery('/admin/memberships', { ok: `${plan.name} deleted.` }));
   }
 
   if (method === 'POST' && (m = pathname.match(/^\/admin\/memberships\/(\d+)\/approve$/))) {
@@ -1296,6 +1349,26 @@ async function adminRoute(req, res, ctx) {
       .run(fields.user_id, fields.rep_code.trim().toUpperCase(), 'active', new Date().toISOString());
     db.prepare("UPDATE users SET role='rep' WHERE id=?").run(fields.user_id);
     return redirect(res, withQuery('/admin/reps', { ok: 'Rep added.' }));
+  }
+
+  if (method === 'POST' && pathname === '/admin/reps/create') {
+    const { fields } = await parseFormBody(req);
+    const email = (fields.email || '').trim().toLowerCase();
+    const name = (fields.name || '').trim();
+    const repCode = (fields.rep_code || '').trim().toUpperCase();
+    if (!email || !name || !repCode) {
+      return redirect(res, withQuery('/admin/reps', { error: 'Name, email and rep code are all required.' }));
+    }
+    if (auth.getUserByEmail(email)) {
+      return redirect(res, withQuery('/admin/reps', { error: `${email} already has an account — use "Make a member a rep" instead.` }));
+    }
+    const password = (fields.password || '').trim() || crypto.randomBytes(6).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 10);
+    const newUser = auth.createUser({ email, password, name, role: 'rep' });
+    db.prepare('INSERT INTO reps (user_id, rep_code, status, joined_at) VALUES (?,?,?,?)')
+      .run(newUser.id, repCode, 'active', new Date().toISOString());
+    return redirect(res, withQuery('/admin/reps', {
+      ok: `Rep account created. Email: ${email} — Password: ${password}. Share these with them now — the password won't be shown again (they can change it from Account → Security once they log in).`,
+    }));
   }
 
   if (method === 'POST' && pathname === '/admin/reps/sales') {

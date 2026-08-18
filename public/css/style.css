@@ -798,6 +798,14 @@ footer { border-top: 1px solid var(--line); padding: 48px 0; margin-top: 60px; b
   opacity: 0;
   transform-origin: left center;
   transition: transform .5s cubic-bezier(0.22, 1, 0.36, 1), opacity .35s ease;
+  /* This card is a printed-ticket look — always dark ink on a white/paper
+     background, regardless of the site's own theme. Without this, the dark
+     theme's --ink/--muted (near-white/light-grey, tuned for a dark page)
+     leaked in here and made every label unreadable on the white card. */
+  --ink: #0a0a0a;
+  --muted: #6b6a65;
+  --line: #dedcd6;
+  color: var(--ink);
 }
 .ticket-modal-backdrop.open .ticket-card { transform: rotateY(0deg) scale(1); opacity: 1; }
 .ticket-modal-close {
