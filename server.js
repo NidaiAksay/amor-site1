@@ -33,6 +33,7 @@ const {
   adminDashboard, adminAnalyticsPage, adminEventsPage, adminEventDetailPage,
   adminMembersPage, adminMembershipsPage, adminRepsPage,
   adminApplicationsPage, adminSuggestionsPage, adminTestimonialsPage, adminMessagesPage,
+  adminTicketsPage,
 } = require('./views/admin');
 
 function loadDotEnv() {
@@ -86,6 +87,15 @@ if (fs.existsSync(SEED_UPLOADS_DIR)) {
     }
   }
 }
+
+// A correlated subquery, not a JOIN, so it stays a single row per event
+// (a JOIN against event_photos would multiply each event row by its photo
+// count). Picks the first photo by sort order — i.e. whatever an admin
+// uploaded and put first in the event's gallery — as that event's card
+// cover image everywhere it's listed. Falls back to the brand gradient +
+// letter mark (see views/components.js: cover()) when an event has no
+// photos yet, which is the common case for a brand-new upcoming event.
+const EVENT_COVER_SQL = `(SELECT image_path FROM event_photos WHERE event_photos.event_id = events.id ORDER BY sort_order ASC, id ASC LIMIT 1) AS cover_photo`;
 
 const POINTS_PER_TICKET = 50;
 // Flat rate rather than a % of revenue: admin-logged sales (the common
@@ -150,7 +160,7 @@ function serveStatic(req, res, pathname) {
 }
 
 function computePoints(quantity, membershipPlanSlug) {
-  const multiplier = membershipPlanSlug === 'plus' || membershipPlanSlug === 'all-access' ? 2 : 1;
+  const multiplier = ['plus', 'all-access', 'unlimited'].includes(membershipPlanSlug) ? 2 : 1;
   return quantity * POINTS_PER_TICKET * multiplier;
 }
 
@@ -392,14 +402,14 @@ ${urls.map((u) => `  <url><loc>${escapeHtml(u.loc)}</loc><priority>${u.priority}
 
   // ---------------- Public pages ----------------
   if (method === 'GET' && pathname === '/') {
-    const upcoming = db.prepare("SELECT * FROM events WHERE status='upcoming' ORDER BY event_date ASC LIMIT 3").all();
-    const pastFeatured = db.prepare("SELECT * FROM events WHERE status='past' ORDER BY event_date DESC LIMIT 1").get();
+    const upcoming = db.prepare(`SELECT events.*, ${EVENT_COVER_SQL} FROM events WHERE status='upcoming' ORDER BY event_date ASC LIMIT 3`).all();
+    const pastFeatured = db.prepare(`SELECT events.*, ${EVENT_COVER_SQL} FROM events WHERE status='past' ORDER BY event_date DESC LIMIT 1`).get();
     const eventsRun = db.prepare("SELECT COUNT(*) c FROM events WHERE status='past'").get().c;
     // Real in-app ticket claims, plus an admin-editable baseline for sales
     // that happened before this site tracked them (edit in Admin →
     // Dashboard settings — defaults to 0, not a hidden magic number).
     const ticketsBaseline = parseInt(getSetting('tickets_sold_baseline', '0'), 10) || 0;
-    const ticketsSold = db.prepare("SELECT COALESCE(SUM(quantity),0) c FROM tickets").get().c + ticketsBaseline;
+    const ticketsSold = db.prepare("SELECT COALESCE(SUM(quantity),0) c FROM tickets WHERE status='verified'").get().c + ticketsBaseline;
     const repCount = db.prepare("SELECT COUNT(*) c FROM reps WHERE status='active'").get().c;
     const heroPhotos = db.prepare('SELECT * FROM hero_photos ORDER BY sort_order ASC, id ASC').all();
     return send(res, 200, homePage({
@@ -413,12 +423,12 @@ ${urls.map((u) => `  <url><loc>${escapeHtml(u.loc)}</loc><priority>${u.priority}
   }
 
   if (method === 'GET' && pathname === '/events') {
-    const events = db.prepare("SELECT * FROM events WHERE status='upcoming' ORDER BY event_date ASC").all();
+    const events = db.prepare(`SELECT events.*, ${EVENT_COVER_SQL} FROM events WHERE status='upcoming' ORDER BY event_date ASC`).all();
     return send(res, 200, eventsListPage({ user, query, events }));
   }
 
   if (method === 'GET' && pathname === '/events/past') {
-    const events = db.prepare("SELECT * FROM events WHERE status='past' ORDER BY event_date DESC").all();
+    const events = db.prepare(`SELECT events.*, ${EVENT_COVER_SQL} FROM events WHERE status='past' ORDER BY event_date DESC`).all();
     return send(res, 200, pastEventsListPage({ user, query, events }));
   }
 
@@ -427,6 +437,7 @@ ${urls.map((u) => `  <url><loc>${escapeHtml(u.loc)}</loc><priority>${u.priority}
     const event = db.prepare("SELECT * FROM events WHERE slug = ? AND status='past'").get(m[1]);
     if (!event) return send(res, 404, 'Event not found');
     const photos = db.prepare('SELECT * FROM event_photos WHERE event_id = ? ORDER BY sort_order ASC, id ASC').all(event.id);
+    event.cover_photo = photos.length ? photos[0].image_path : null;
     return send(res, 200, pastEventDetailPage({ user, query, event, photos, origin }));
   }
 
@@ -434,10 +445,55 @@ ${urls.map((u) => `  <url><loc>${escapeHtml(u.loc)}</loc><priority>${u.priority}
     const event = db.prepare("SELECT * FROM events WHERE slug = ?").get(m[1]);
     if (!event) return send(res, 404, 'Event not found');
     if (event.status === 'past') return redirect(res, `/events/past/${event.slug}`);
-    const attendeeCount = db.prepare('SELECT COALESCE(SUM(quantity),0) c FROM tickets WHERE event_id = ?').get(event.id).c;
+    const attendeeCount = db.prepare("SELECT COALESCE(SUM(quantity),0) c FROM tickets WHERE event_id = ? AND status != 'rejected'").get(event.id).c;
     const photo = db.prepare('SELECT * FROM event_photos WHERE event_id = ? ORDER BY sort_order ASC, id ASC LIMIT 1').get(event.id);
+    event.cover_photo = photo ? photo.image_path : null;
     const waitlistJoined = query.waitlist === 'joined';
-    return send(res, 200, eventDetailPage({ user, query, event, attendeeCount, photo, origin, waitlistJoined }));
+    // AMOR Unlimited members get one free "comp" entry per event (see the
+    // /claim-membership route below) instead of buying via Fatsoma —
+    // capacity is first-come-first-served same as anyone else, so a member
+    // can still miss out on a sold-out night.
+    let membershipComp = null;
+    if (user) {
+      const membership = getActiveMembership(user.id);
+      if (membership && membership.status === 'active' && membership.plan_slug === 'unlimited') {
+        const alreadyClaimed = Boolean(
+          db.prepare('SELECT 1 FROM tickets WHERE user_id = ? AND event_id = ? AND is_membership_comp = 1').get(user.id, event.id)
+        );
+        const atCapacity = event.capacity != null && attendeeCount >= event.capacity;
+        membershipComp = { eligible: true, alreadyClaimed, atCapacity };
+      }
+    }
+    return send(res, 200, eventDetailPage({ user, query, event, attendeeCount, photo, origin, waitlistJoined, membershipComp }));
+  }
+
+  if (method === 'POST' && (m = pathname.match(/^\/events\/([^/]+)\/claim-membership$/))) {
+    if (!user) return redirect(res, `/login?next=/events/${m[1]}`);
+    const event = db.prepare('SELECT * FROM events WHERE slug = ?').get(m[1]);
+    if (!event) return send(res, 404, 'Event not found');
+    const membership = getActiveMembership(user.id);
+    if (!membership || membership.status !== 'active' || membership.plan_slug !== 'unlimited') {
+      return redirect(res, withQuery(`/events/${event.slug}`, { error: 'AMOR Unlimited membership required for free entry.' }));
+    }
+    const alreadyClaimed = db.prepare('SELECT 1 FROM tickets WHERE user_id = ? AND event_id = ? AND is_membership_comp = 1').get(user.id, event.id);
+    if (alreadyClaimed) {
+      return redirect(res, withQuery(`/events/${event.slug}`, { error: 'You already claimed your free entry for this event.' }));
+    }
+    const attendeeCount = db.prepare("SELECT COALESCE(SUM(quantity),0) c FROM tickets WHERE event_id = ? AND status != 'rejected'").get(event.id).c;
+    if (event.capacity != null && attendeeCount >= event.capacity) {
+      return redirect(res, withQuery(`/events/${event.slug}`, { error: "This event just hit capacity, so free entries are full too — message us and we'll see what we can do." }));
+    }
+    const points = computePoints(1, membership.plan_slug);
+    const now = new Date().toISOString();
+    const code = randomCode('TKT');
+    // Auto-verified, unlike a self-reported Fatsoma claim below — there's
+    // no order reference to fake here, the only thing gating this is an
+    // active paid membership, which is already verified by Stripe/admin.
+    db.prepare(`INSERT INTO tickets (user_id, event_id, quantity, redeem_code, points_awarded, is_membership_comp, status, created_at)
+      VALUES (?,?,?,?,?,1,'verified',?)`).run(user.id, event.id, 1, code, points, now);
+    db.prepare(`INSERT INTO points_ledger (user_id, delta, reason, created_at) VALUES (?,?,?,?)`)
+      .run(user.id, points, `Free entry via AMOR Unlimited — ${event.title}`, now);
+    return redirect(res, withQuery('/account', { ok: `You're in — free entry to "${event.title}" claimed. Show your account page (or code ${code}) at the door.` }));
   }
 
   if (method === 'POST' && (m = pathname.match(/^\/events\/([^/]+)\/waitlist$/))) {
@@ -464,26 +520,27 @@ ${urls.map((u) => `  <url><loc>${escapeHtml(u.loc)}</loc><priority>${u.priority}
       return redirect(res, withQuery(`/events/${event.slug}`, { error: 'Enter your Fatsoma order reference to claim.' }));
     }
 
-    const membership = getActiveMembership(user.id);
-    const isActive = membership && membership.status === 'active';
-    const points = computePoints(quantity, isActive ? membership.plan_slug : null);
+    // Anti-fraud: typing literally anything in here used to instantly bank
+    // real points and (if a rep code was attached) real commission — no
+    // check against Fatsoma at all. Two guards now: the same order
+    // reference can't be claimed twice for this event (unique index in
+    // lib/db.js), and every claim lands as 'pending' rather than paying
+    // out immediately — an admin has to verify it against the actual
+    // Fatsoma order list at /admin/tickets before points/commission land.
+    const duplicate = db.prepare('SELECT 1 FROM tickets WHERE event_id = ? AND order_ref = ?').get(event.id, orderRef);
+    if (duplicate) {
+      return redirect(res, withQuery(`/events/${event.slug}`, { error: 'That order reference has already been claimed on an AMOR account.' }));
+    }
 
     let rep = null;
     if (repCode) rep = db.prepare('SELECT * FROM reps WHERE rep_code = ?').get(repCode);
 
     const now = new Date().toISOString();
     const code = randomCode('TKT');
-    db.prepare(`INSERT INTO tickets (user_id, event_id, rep_id, quantity, redeem_code, points_awarded, created_at)
-      VALUES (?,?,?,?,?,?,?)`).run(user.id, event.id, rep ? rep.id : null, quantity, code, points, now);
-    db.prepare(`INSERT INTO points_ledger (user_id, delta, reason, created_at) VALUES (?,?,?,?)`)
-      .run(user.id, points, `Claimed ticket — ${event.title}`, now);
+    db.prepare(`INSERT INTO tickets (user_id, event_id, rep_id, quantity, redeem_code, order_ref, status, points_awarded, created_at)
+      VALUES (?,?,?,?,?,?,'pending',0,?)`).run(user.id, event.id, rep ? rep.id : null, quantity, code, orderRef, now);
 
-    if (rep) {
-      db.prepare(`INSERT INTO rep_sales (rep_id, event_id, tickets_sold, revenue_cents, note, created_at) VALUES (?,?,?,?,?,?)`)
-        .run(rep.id, event.id, quantity, (event.price_from_cents || 0) * quantity, `Self-reported via ticket claim (order ${orderRef})`, now);
-    }
-
-    return redirect(res, withQuery('/account', { ok: `Ticket claimed — you earned ${points} points.` }));
+    return redirect(res, withQuery('/account', { ok: "Claim submitted — we check every order reference against Fatsoma before points and rep credit land, so it may take a little while to show as verified." }));
   }
 
   // ---------------- Membership ----------------
@@ -764,7 +821,7 @@ async function adminRoute(req, res, ctx) {
     const stats = {
       members: db.prepare("SELECT COUNT(*) c FROM users WHERE role='member'").get().c,
       upcomingEvents: db.prepare("SELECT COUNT(*) c FROM events WHERE status='upcoming'").get().c,
-      ticketsClaimed: db.prepare('SELECT COALESCE(SUM(quantity),0) c FROM tickets').get().c,
+      ticketsClaimed: db.prepare("SELECT COALESCE(SUM(quantity),0) c FROM tickets WHERE status='verified'").get().c,
       pendingMemberships: db.prepare("SELECT COUNT(*) c FROM memberships WHERE status='pending'").get().c,
       activeReps: db.prepare("SELECT COUNT(*) c FROM reps WHERE status='active'").get().c,
       creditsOutstanding: db.prepare('SELECT COALESCE(SUM(delta),0) c FROM credits_ledger').get().c,
@@ -778,6 +835,7 @@ async function adminRoute(req, res, ctx) {
       pendingApplications: db.prepare("SELECT COUNT(*) c FROM rep_applications WHERE status='pending'").get().c,
       newSuggestions: db.prepare("SELECT COUNT(*) c FROM song_suggestions WHERE status='new'").get().c,
       unreadMessages: db.prepare('SELECT COUNT(*) c FROM contact_messages WHERE read_at IS NULL').get().c,
+      pendingTicketClaims: db.prepare("SELECT COUNT(*) c FROM tickets WHERE status='pending'").get().c,
     };
     const heroPhotos = db.prepare('SELECT * FROM hero_photos ORDER BY sort_order ASC, id ASC').all();
     return send(res, 200, adminDashboard({ user, query, stats, settings, attention, heroPhotos }));
@@ -824,11 +882,74 @@ async function adminRoute(req, res, ctx) {
       LEFT JOIN users ON users.id = tickets.user_id
       ORDER BY tickets.created_at DESC
     `).all();
-    const rows = [['Event', 'Member', 'Email', 'Quantity', 'Points awarded', 'Redeem code', 'Claimed at']];
+    const rows = [['Event', 'Member', 'Email', 'Quantity', 'Order ref', 'Status', 'Points awarded', 'Redeem code', 'Claimed at']];
     for (const t of tickets) {
-      rows.push([t.event_title, t.member_name || '', t.member_email || '', t.quantity, t.points_awarded, t.redeem_code, t.created_at]);
+      rows.push([t.event_title, t.member_name || '', t.member_email || '', t.quantity, t.order_ref || '', t.status, t.points_awarded, t.redeem_code, t.created_at]);
     }
     return send(res, 200, toCsv(rows), { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="amor-tickets.csv"' });
+  }
+
+  if (method === 'GET' && pathname === '/admin/tickets') {
+    const tickets = db.prepare(`
+      SELECT tickets.*, events.title as event_title, users.name as member_name, users.email as member_email, reps.rep_code
+      FROM tickets
+      JOIN events ON events.id = tickets.event_id
+      LEFT JOIN users ON users.id = tickets.user_id
+      LEFT JOIN reps ON reps.id = tickets.rep_id
+      WHERE tickets.is_membership_comp = 0
+      ORDER BY (tickets.status = 'pending') DESC, tickets.created_at DESC
+    `).all();
+    return send(res, 200, adminTicketsPage({ user, query, tickets }));
+  }
+
+  if (method === 'POST' && (m = pathname.match(/^\/admin\/tickets\/(\d+)\/verify$/))) {
+    const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(m[1]);
+    if (ticket && ticket.status === 'pending') {
+      const membership = getActiveMembership(ticket.user_id);
+      const isActive = membership && membership.status === 'active';
+      const points = computePoints(ticket.quantity, isActive ? membership.plan_slug : null);
+      const now = new Date().toISOString();
+      db.prepare("UPDATE tickets SET status='verified', points_awarded=? WHERE id=?").run(points, ticket.id);
+      db.prepare('INSERT INTO points_ledger (user_id, delta, reason, created_at) VALUES (?,?,?,?)')
+        .run(ticket.user_id, points, 'Claimed ticket — verified against Fatsoma', now);
+      if (ticket.rep_id) {
+        const event = db.prepare('SELECT * FROM events WHERE id = ?').get(ticket.event_id);
+        db.prepare(`INSERT INTO rep_sales (rep_id, event_id, tickets_sold, revenue_cents, note, created_at) VALUES (?,?,?,?,?,?)`)
+          .run(ticket.rep_id, ticket.event_id, ticket.quantity, (event.price_from_cents || 0) * ticket.quantity,
+            `Verified ticket claim (order ${ticket.order_ref})`, now);
+      }
+    }
+    return redirect(res, withQuery('/admin/tickets', { ok: 'Ticket verified — points and any rep commission are now live.' }));
+  }
+
+  if (method === 'POST' && (m = pathname.match(/^\/admin\/tickets\/(\d+)\/reject$/))) {
+    db.prepare("UPDATE tickets SET status='rejected' WHERE id = ? AND status = 'pending'").run(m[1]);
+    return redirect(res, withQuery('/admin/tickets', { ok: 'Claim rejected — no points or commission awarded.' }));
+  }
+
+  if (method === 'POST' && pathname === '/admin/tickets/bulk-verify') {
+    const { fields } = await parseFormBody(req);
+    const ids = (fields.ids || '').split(',').map((s) => parseInt(s, 10)).filter(Boolean);
+    let count = 0;
+    for (const id of ids) {
+      const ticket = db.prepare("SELECT * FROM tickets WHERE id = ? AND status = 'pending'").get(id);
+      if (!ticket) continue;
+      const membership = getActiveMembership(ticket.user_id);
+      const isActive = membership && membership.status === 'active';
+      const points = computePoints(ticket.quantity, isActive ? membership.plan_slug : null);
+      const now = new Date().toISOString();
+      db.prepare("UPDATE tickets SET status='verified', points_awarded=? WHERE id=?").run(points, ticket.id);
+      db.prepare('INSERT INTO points_ledger (user_id, delta, reason, created_at) VALUES (?,?,?,?)')
+        .run(ticket.user_id, points, 'Claimed ticket — verified against Fatsoma', now);
+      if (ticket.rep_id) {
+        const event = db.prepare('SELECT * FROM events WHERE id = ?').get(ticket.event_id);
+        db.prepare(`INSERT INTO rep_sales (rep_id, event_id, tickets_sold, revenue_cents, note, created_at) VALUES (?,?,?,?,?,?)`)
+          .run(ticket.rep_id, ticket.event_id, ticket.quantity, (event.price_from_cents || 0) * ticket.quantity,
+            `Verified ticket claim (order ${ticket.order_ref})`, now);
+      }
+      count++;
+    }
+    return redirect(res, withQuery('/admin/tickets', { ok: `${count} ticket${count === 1 ? '' : 's'} verified.` }));
   }
 
   if (method === 'GET' && pathname === '/admin/export/rep-sales.csv') {
@@ -864,7 +985,7 @@ async function adminRoute(req, res, ctx) {
     const uniqueVisitors = db.prepare('SELECT COUNT(DISTINCT visitor_id) c FROM page_views').get().c;
     const uniqueVisitors7d = db.prepare('SELECT COUNT(DISTINCT visitor_id) c FROM page_views WHERE created_at >= ?').get(since7).c;
     const ticketClicks = db.prepare("SELECT COUNT(*) c FROM site_events WHERE kind='ticket_click'").get().c;
-    const ticketsClaimed = db.prepare('SELECT COALESCE(SUM(quantity),0) c FROM tickets').get().c;
+    const ticketsClaimed = db.prepare("SELECT COALESCE(SUM(quantity),0) c FROM tickets WHERE status='verified'").get().c;
     const topPages = db.prepare('SELECT path, COUNT(*) c FROM page_views GROUP BY path ORDER BY c DESC LIMIT 8').all();
     const repLinkHits = db.prepare(`
       SELECT rep_code, COUNT(*) c FROM site_events
@@ -1067,6 +1188,32 @@ async function adminRoute(req, res, ctx) {
       db.prepare('DELETE FROM event_photos WHERE id = ?').run(m[2]);
     }
     return redirect(res, withQuery(`/admin/events/${m[1]}`, { ok: 'Photo removed.' }));
+  }
+
+  // Permanently removes an event — used for clearing out a duplicate or a
+  // leftover placeholder event, not something offered for a real event
+  // with real ticket holders. Deletes every row across the app that
+  // references this event_id (photos on disk too) before the event row
+  // itself, since foreign keys are enforced (PRAGMA foreign_keys = ON in
+  // lib/db.js) and would otherwise reject the delete.
+  if (method === 'POST' && (m = pathname.match(/^\/admin\/events\/(\d+)\/delete$/))) {
+    const eventId = m[1];
+    const event = db.prepare('SELECT * FROM events WHERE id = ?').get(eventId);
+    if (event) {
+      const photos = db.prepare('SELECT * FROM event_photos WHERE event_id = ?').all(eventId);
+      for (const photo of photos) {
+        const filePath = resolveMediaPath(photo.image_path);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      }
+      db.prepare('DELETE FROM event_photos WHERE event_id = ?').run(eventId);
+      db.prepare('DELETE FROM rep_sales WHERE event_id = ?').run(eventId);
+      db.prepare('DELETE FROM tickets WHERE event_id = ?').run(eventId);
+      db.prepare('DELETE FROM site_events WHERE event_id = ?').run(eventId);
+      db.prepare('DELETE FROM waitlist WHERE event_id = ?').run(eventId);
+      db.prepare('DELETE FROM events WHERE id = ?').run(eventId);
+      return redirect(res, withQuery('/admin/events', { ok: `"${event.title}" deleted.` }));
+    }
+    return redirect(res, withQuery('/admin/events', { error: 'Event not found.' }));
   }
 
   if (method === 'GET' && pathname === '/admin/members') {

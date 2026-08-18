@@ -142,6 +142,7 @@ ${footer()}
 <script src="/js/ticket-modal.js" defer></script>
 <script src="/js/countdown.js" defer></script>
 <script src="/js/rep-link.js" defer></script>
+<script src="/js/stat-counters.js" defer></script>
 ${active === 'admin' ? '<script src="/js/admin-bulk.js" defer></script>' : ''}
 </body>
 </html>`;

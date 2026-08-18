@@ -124,7 +124,7 @@ function pastEventsListPage({ user, query, events }) {
   return layout({ title: 'Past Events', user, active: 'past', body, query });
 }
 
-function eventDetailPage({ user, query, event, plansCount, attendeeCount = 0, photo, origin, waitlistJoined = false }) {
+function eventDetailPage({ user, query, event, plansCount, attendeeCount = 0, photo, origin, waitlistJoined = false, membershipComp = null }) {
   const body = `
   <section style="padding-top:48px;">
     <div class="wrap split">
@@ -143,6 +143,20 @@ function eventDetailPage({ user, query, event, plansCount, attendeeCount = 0, ph
           <div class="stat-box"><b>${event.capacity || '—'}</b><span>Capacity</span></div>
         </div>
         ${flash(query)}
+        ${membershipComp && membershipComp.eligible ? `
+        <div class="card" style="margin-bottom:16px; border-color:#4a4ac8;">
+          <h3 class="h3" style="margin-bottom:6px;">Your AMOR Unlimited entry</h3>
+          ${membershipComp.alreadyClaimed
+            ? `<p class="muted" style="font-size:0.88rem;">You've already claimed your free entry to this one — check <a href="/account" class="accent">your account</a> for the code.</p>`
+            : membershipComp.atCapacity
+              ? `<p class="muted" style="font-size:0.88rem;">This event's at capacity, so free entries are full too — <a href="/contact" class="accent">get in touch</a> and we'll see what we can do.</p>`
+              : `
+              <p class="muted" style="font-size:0.88rem; margin-bottom:12px;">Included with your membership — no Fatsoma purchase needed.</p>
+              <form method="POST" action="/events/${event.slug}/claim-membership">
+                <button type="submit" class="btn btn-solid btn-block">Claim free entry</button>
+              </form>`}
+        </div>
+        ` : ''}
         ${event.fatsoma_url
           ? `<a href="${escapeHtml(event.fatsoma_url)}" target="_blank" rel="noopener" class="btn btn-solid btn-block"
               data-ticket-trigger

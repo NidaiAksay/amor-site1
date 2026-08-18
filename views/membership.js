@@ -14,9 +14,9 @@ function membershipPage({ user, query, plans, currentMembership }) {
   <section style="padding-top:16px;">
     <div class="wrap">
       ${flash(query)}
-      <div class="grid grid-3">
-        ${plans.map((p, i) => `
-        <div class="plan ${i === 1 ? 'featured' : ''}">
+      <div class="grid ${plans.length >= 4 ? 'grid-4' : 'grid-3'}">
+        ${plans.map((p) => `
+        <div class="plan ${p.slug === 'plus' ? 'featured' : ''}">
           <div class="eyebrow">${escapeHtml(p.period)}</div>
           <h3 class="h3">${escapeHtml(p.name)}</h3>
           <div class="price">${formatMoney(p.price_cents)}<span> / ${escapeHtml(p.period)}</span></div>

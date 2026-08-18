@@ -3,9 +3,14 @@ const { escapeHtml, formatDateShort, formatMoney } = require('../lib/util');
 
 function cover(event, { small } = {}) {
   const tone = ((event.cover_tone || 1) % 6) + 1;
+  // event.cover_photo (a real uploaded photo's path) takes over from the
+  // brand gradient + letter mark once an admin has uploaded at least one
+  // photo for the event — see EVENT_COVER_SQL in server.js for where it
+  // comes from. No photo yet -> same placeholder as always.
+  const hasPhoto = Boolean(event.cover_photo);
   return `
   <div class="cover cover-${tone} ${small ? 'cover-sm' : ''}">
-    <div class="mark">A</div>
+    ${hasPhoto ? `<img src="${escapeHtml(event.cover_photo)}" alt="">` : `<div class="mark">A</div>`}
     <div class="label">
       <div class="eyebrow">${formatDateShort(event.event_date)} · ${escapeHtml(event.venue)}</div>
       <h4>${escapeHtml(event.title)}</h4>

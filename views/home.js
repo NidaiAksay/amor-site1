@@ -67,10 +67,16 @@ function homePage({ user, query, upcoming, pastFeatured, stats, heroPhotos = [],
         // Never ship a visibly blank/zero stat — a brand-new deployment with
         // no events run yet, no tickets tracked, or no reps signed up should
         // just show fewer tiles, not "0+" ones that read as broken.
+        // data-count-to + data-suffix drive a one-time count-up animation
+        // (0 -> the real number) on page load, handled by
+        // /js/stat-counters.js. The real number is still what's in the
+        // markup, so anyone without JS (or a crawler) just sees the
+        // correct static value — the animation is a progressive
+        // enhancement, not the source of truth.
         const tiles = [
-          stats.eventsRun > 0 ? `<div class="hero-stat"><b>${stats.eventsRun}+</b><span>Events run</span></div>` : '',
-          stats.ticketsSold > 0 ? `<div class="hero-stat"><b>${stats.ticketsSold}+</b><span>Tickets sold</span></div>` : '',
-          stats.repCount > 0 ? `<div class="hero-stat"><b>${stats.repCount}</b><span>Active reps</span></div>` : '',
+          stats.eventsRun > 0 ? `<div class="hero-stat"><b data-count-to="${stats.eventsRun}" data-suffix="+">${stats.eventsRun}+</b><span>Events run</span></div>` : '',
+          stats.ticketsSold > 0 ? `<div class="hero-stat"><b data-count-to="${stats.ticketsSold}" data-suffix="+">${stats.ticketsSold}+</b><span>Tickets sold</span></div>` : '',
+          stats.repCount > 0 ? `<div class="hero-stat"><b data-count-to="${stats.repCount}">${stats.repCount}</b><span>Active reps</span></div>` : '',
         ].filter(Boolean);
         return tiles.length ? `<div class="hero-stats">${tiles.join('')}</div>` : '';
       })()}

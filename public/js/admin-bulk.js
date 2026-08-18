@@ -25,13 +25,17 @@
       var form = g.submitBtn.form;
       var idsInput = form && form.querySelector('input[name="ids"]');
       if (!idsInput) return;
+      // Whatever verb the button already says (e.g. "Approve selected",
+      // "Verify selected") is kept as-is — this just appends the count
+      // rather than assuming every bulk action is an "approve".
+      var baseLabel = g.submitBtn.textContent.trim();
 
       function sync() {
         var ids = g.checkboxes.filter(function (cb) { return cb.checked; })
           .map(function (cb) { return cb.getAttribute('data-bulk-id'); });
         idsInput.value = ids.join(',');
         g.submitBtn.disabled = ids.length === 0;
-        g.submitBtn.textContent = ids.length ? 'Approve selected (' + ids.length + ')' : 'Approve selected';
+        g.submitBtn.textContent = ids.length ? baseLabel + ' (' + ids.length + ')' : baseLabel;
       }
 
       g.checkboxes.forEach(function (cb) { cb.addEventListener('change', sync); });

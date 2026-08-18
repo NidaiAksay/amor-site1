@@ -31,14 +31,15 @@ function accountPage({ user, query, pointsBalance, creditsBalance, membership, p
         <h2 class="h3" style="margin-bottom:16px;">Your tickets</h2>
         ${tickets.length ? `
         <table class="simple">
-          <thead><tr><th>Event</th><th>Date</th><th>Qty</th><th>Points earned</th><th>Code</th></tr></thead>
+          <thead><tr><th>Event</th><th>Date</th><th>Qty</th><th>Status</th><th>Points earned</th><th>Code</th></tr></thead>
           <tbody>
             ${tickets.map((t) => `
             <tr>
-              <td>${escapeHtml(t.title)}</td>
+              <td>${escapeHtml(t.title)}${t.is_membership_comp ? ' <span class="badge-selling-fast" style="position:static; display:inline-block; margin-left:6px;">Free — AMOR Unlimited</span>' : ''}</td>
               <td>${formatDate(t.event_date)}</td>
               <td>${t.quantity}</td>
-              <td>+${t.points_awarded}</td>
+              <td>${t.status === 'verified' ? '<span class="pill pill-active">Verified</span>' : t.status === 'rejected' ? '<span class="pill">Not verified</span>' : '<span class="pill">Pending review</span>'}</td>
+              <td>${t.status === 'pending' ? '<span class="muted">—</span>' : `+${t.points_awarded}`}</td>
               <td class="muted">${escapeHtml(t.redeem_code)}</td>
             </tr>`).join('')}
           </tbody>

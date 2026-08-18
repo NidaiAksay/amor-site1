@@ -9,6 +9,7 @@ function adminNav(activeSub) {
     ['/admin', 'Overview', 'overview'],
     ['/admin/analytics', 'Analytics', 'analytics'],
     ['/admin/events', 'Events', 'events'],
+    ['/admin/tickets', 'Ticket claims', 'tickets'],
     ['/admin/members', 'Members', 'members'],
     ['/admin/memberships', 'Membership requests', 'memberships'],
     ['/admin/reps', 'Reps & Sales', 'reps'],
@@ -22,6 +23,7 @@ function adminNav(activeSub) {
 
 function adminDashboard({ user, query, stats, settings, attention, heroPhotos = [] }) {
   const items = [
+    attention.pendingTicketClaims > 0 ? { label: `${attention.pendingTicketClaims} ticket claim${attention.pendingTicketClaims === 1 ? '' : 's'} to verify`, href: '/admin/tickets' } : null,
     attention.pendingMemberships > 0 ? { label: `${attention.pendingMemberships} pending membership request${attention.pendingMemberships === 1 ? '' : 's'}`, href: '/admin/memberships' } : null,
     attention.pendingApplications > 0 ? { label: `${attention.pendingApplications} new team application${attention.pendingApplications === 1 ? '' : 's'}`, href: '/admin/applications' } : null,
     attention.newSuggestions > 0 ? { label: `${attention.newSuggestions} new song suggestion${attention.newSuggestions === 1 ? '' : 's'}`, href: '/admin/suggestions' } : null,
@@ -306,6 +308,19 @@ function adminEventDetailPage({ user, query, event, photos, waitlistRows = [], e
         ` : ''}
         ` : `<p class="muted">No one's joined the waitlist for this event yet.</p>`}
       </div>
+
+      <div class="card" style="margin-top:20px; border-color:#7a2020;">
+        <h3 class="h3" style="margin-bottom:6px;">Danger zone</h3>
+        <p class="muted" style="font-size:0.85rem; margin-bottom:16px;">
+          Permanently deletes this event, its photos, and any tickets, waitlist signups, or rep sales
+          logged against it. This can't be undone — meant for removing a duplicate or a placeholder
+          event, not a real one people already have tickets for.
+        </p>
+        <form method="POST" action="/admin/events/${event.id}/delete"
+          onsubmit="return confirm('Delete &quot;${escapeHtml(event.title).replace(/'/g, "\\'")}&quot; permanently? This removes its photos and any ticket/waitlist records for it. This can\\'t be undone.');">
+          <button type="submit" class="btn btn-sm" style="border-color:#a83232; color:#ff8a8a;">Delete this event</button>
+        </form>
+      </div>
     </div>
   </section>`;
   return layout({ title: `Admin · ${event.title}`, user, active: 'admin', body, query });
@@ -388,6 +403,62 @@ function adminMembershipsPage({ user, query, requests }) {
     </div>
   </section>`;
   return layout({ title: 'Admin · Memberships', user, active: 'admin', body, query });
+}
+
+function adminTicketsPage({ user, query, tickets }) {
+  const pendingCount = tickets.filter((t) => t.status === 'pending').length;
+  const statusPill = (status) => {
+    if (status === 'verified') return '<span class="pill pill-active">Verified</span>';
+    if (status === 'rejected') return '<span class="pill">Rejected</span>';
+    return '<span class="pill">Pending</span>';
+  };
+  const body = `
+  <section style="padding-top:48px;">
+    <div class="wrap">
+      <div class="eyebrow">Admin</div>
+      <h1 class="h2">Ticket claims</h1>
+      <p class="muted" style="font-size:0.88rem; margin-top:-8px; margin-bottom:16px;">
+        Every self-reported claim lands here as pending — check the order reference against your Fatsoma sales
+        before verifying. Points and rep commission only land once you verify. AMOR Unlimited free entries don't
+        need review (no order to fake) so they don't show up in this list.
+      </p>
+      ${flash(query)}
+      ${pendingCount > 1 ? `
+      <form method="POST" action="/admin/tickets/bulk-verify" class="bulk-form" id="bulkVerifyTickets">
+        <input type="hidden" name="ids" value="">
+      </form>
+      <div style="margin-bottom:10px;"><button type="submit" form="bulkVerifyTickets" data-bulk-submit data-bulk-group="tickets" class="btn btn-sm" disabled>Verify selected</button></div>
+      ` : ''}
+      <div class="admin-table-wrap">
+      <table class="simple">
+        <thead><tr>${pendingCount > 1 ? '<th style="width:32px;"><input type="checkbox" data-select-all data-bulk-group="tickets"></th>' : ''}<th>Member</th><th>Event</th><th>Qty</th><th>Order ref</th><th>Rep</th><th>Claimed</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          ${tickets.length ? tickets.map((t) => `
+          <tr>
+            ${pendingCount > 1 ? `<td>${t.status === 'pending' ? `<input type="checkbox" data-bulk-id="${t.id}" data-bulk-group="tickets">` : ''}</td>` : ''}
+            <td>${escapeHtml(t.member_name || '—')} <span class="muted">(${escapeHtml(t.member_email || '—')})</span></td>
+            <td>${escapeHtml(t.event_title)}</td>
+            <td>${t.quantity}</td>
+            <td class="muted">${escapeHtml(t.order_ref || '—')}</td>
+            <td class="muted">${escapeHtml(t.rep_code || '—')}</td>
+            <td class="muted">${formatDate(t.created_at)}</td>
+            <td>${statusPill(t.status)}</td>
+            <td>
+              ${t.status === 'pending' ? `
+              <form method="POST" action="/admin/tickets/${t.id}/verify" style="display:inline;">
+                <button type="submit" class="btn btn-sm">Verify</button>
+              </form>
+              <form method="POST" action="/admin/tickets/${t.id}/reject" style="display:inline;">
+                <button type="submit" class="btn btn-sm">Reject</button>
+              </form>` : ''}
+            </td>
+          </tr>`).join('') : `<tr><td colspan="${pendingCount > 1 ? 8 : 7}" class="muted">No ticket claims yet.</td></tr>`}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  </section>`;
+  return layout({ title: 'Admin · Ticket claims', user, active: 'admin', body, query });
 }
 
 function adminRepsPage({ user, query, reps, candidateUsers, events, commissionPerTicketCents }) {
@@ -661,4 +732,5 @@ module.exports = {
   adminSuggestionsPage,
   adminTestimonialsPage,
   adminMessagesPage,
+  adminTicketsPage,
 };
